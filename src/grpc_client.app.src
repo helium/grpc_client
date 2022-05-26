@@ -4,4 +4,4 @@
   {modules,[]},
   {registered, []},
   {env, []},
-  {applications,[]}]}.
+  {applications,[http2_client]}]}.

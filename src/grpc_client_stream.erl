@@ -1,3 +1,22 @@
+%% NOTE:
+%% copied and modified from https://github.com/Bluehouse-Technology/grpc_client/blob/master/src/grpc_client_stream.erl
+%% requires the gpb modules to have been created with the following config:
+%%{gpb_opts, [
+%%        {rename,{msg_fqname,base_name}},
+%%        use_packages,
+%%        {report_errors, false},
+%%        {descriptor, false},
+%%        {recursive, false},
+%%        {i, "_build/default/lib/helium_proto/src"},
+%%        {o, "src/grpc/autogen/client"},
+%%        {module_name_prefix, ""},
+%%        {module_name_suffix, "_client_pb"},
+%%        {rename, {msg_name, {suffix, "_pb"}}},
+%%        {strings_as_binaries, false},
+%%        type_specs,
+%%        {defs_as_proplists, true}
+%%]}
+
 %%%-------------------------------------------------------------------
 %%% Licensed to the Apache Software Foundation (ASF) under one
 %%% or more contributor license agreements.  See the NOTICE file
@@ -24,7 +43,7 @@
 
 -behaviour(gen_server).
 
--export([new/5,
+-export([new/6,
          send/2, send_last/2,
          get/1, rcv/1, rcv/2,
          state/1,
@@ -34,7 +53,6 @@
 %% gen_server behaviors
 -export([code_change/3, handle_call/3, handle_cast/2, handle_info/2, init/1, terminate/2]).
 
--type connection() :: grpc_client_connection:connection().
 -type stream() ::
     #{stream_id := integer(),
       package := string(),
@@ -48,16 +66,23 @@
       headers_sent := boolean(),
       metadata := grpc_client:metadata(),
       compression := grpc_client:compression_method(),
-      buffer := binary()}.
+      buffer := binary(),
+      handler_callback := undefined,
+      handler_state := undefined,
+      type := unary | streaming | undefined,
+      conn_monitor_ref := reference()}.
 
--spec new(Connection::connection(),
+-export_type([stream/0]).
+
+-spec new(Connection::grpc_client:connection(),
           Service::atom(),
           Rpc::atom(),
           Encoder::module(),
-          Options::list()) -> {ok, Pid::pid()} | {error, Reason::term()}.
-new(Connection, Service, Rpc, Encoder, Options) ->
+          Options::list(),
+          HandlerMod::module() ) -> {ok, Pid::pid()} | {error, Reason::term()}.
+new(Connection, Service, Rpc, Encoder, Options, HandlerMod) ->
     gen_server:start_link(?MODULE,
-                          {Connection, Service, Rpc, Encoder, Options}, []).
+                          {Connection, Service, Rpc, Encoder, Options, HandlerMod}, []).
 
 send(Pid, Message) ->
     gen_server:call(Pid, {send, Message}).
@@ -99,11 +124,22 @@ call_rpc(Pid, Message, Timeout) ->
 
 %% gen_server implementation
 %% @private
-init({Connection, Service, Rpc, Encoder, Options}) ->
+init({#{http_connection := ConnPid} = Connection, Service, Rpc, Encoder, Options, HandlerMod}) ->
     try
-        {ok, new_stream(Connection, Service, Rpc, Encoder, Options)}
+        StreamType = proplists:get_value(type, Options, undefined),
+        lager:info("init stream for RPC ~p and type ~p", [Rpc, StreamType]),
+        Stream =  new_stream(Connection, Service, Rpc, Encoder, Options),
+        lager:info("init stream success with state ~p, handle_mod: ~p", [Stream, HandlerMod]),
+        HandlerState = HandlerMod:init(),
+        %% monitor our connection, so we can tear down stream if conn dies
+        Ref = monitor(process, ConnPid),
+        {ok, Stream#{handler_state => HandlerState,
+                     handler_callback => HandlerMod,
+                     type => StreamType,
+                     conn_monitor_ref => Ref}}
     catch
-        _Class:_Error ->
+        _Class:_Error:_Stack ->
+            lager:warning("failed to create stream, ~p ~p ~p", [_Class, _Error, _Stack]),
             {stop, <<"failed to create stream">>}
     end.
 
@@ -211,8 +247,16 @@ handle_info(timeout, #{response_pending := true,
                        client := Client} = Stream) ->
     gen_server:reply(Client, {error, timeout}),
     {noreply, Stream#{response_pending => false}};
-handle_info(_InfoMessage, Stream) ->
-    {noreply, Stream}.
+handle_info({'DOWN', Ref, process, _, _Reason}, #{conn_mon := Ref} = C) ->
+    %% our connection is down, nothing more stream can do other then terminate
+    {stop, connection_down, C};
+handle_info(Msg, #{handler_callback := HandlerCB} = Stream) ->
+    NewState =
+        case erlang:function_exported(HandlerCB, handle_info, 2) of
+            true -> HandlerCB:handle_info(Msg, Stream);
+            false -> Stream
+        end,
+    {noreply, NewState}.
 
 %% @private
 terminate(_Reason, _State) ->
@@ -227,10 +271,11 @@ new_stream(Connection, Service, Rpc, Encoder, Options) ->
     TransportOptions = proplists:get_value(http2_options, Options, []),
     {ok, StreamId} = grpc_client_connection:new_stream(Connection, TransportOptions),
     RpcDef = Encoder:find_rpc_def(Service, Rpc),
+    RpcDefMap = maps:from_list(RpcDef),
     %% the gpb rpc def has 'input', 'output' etc.
     %% All the information is combined in 1 map,
     %% which is is the state of the gen_server.
-    RpcDef#{stream_id => StreamId,
+    RpcDefMap#{stream_id => StreamId,
             package => [],
             service => Service,
             rpc => Rpc,
@@ -316,10 +361,20 @@ info_response(Response, #{response_pending := true,
                           client := Client} = Stream) ->
     gen_server:reply(Client, Response),
     {noreply, Stream#{response_pending => false}};
-info_response(Response, #{queue := Queue} = Stream) ->
+info_response(Response, #{queue := Queue, type := unary} = Stream) ->
     NewQueue = queue:in(Response, Queue),
-    {noreply, Stream#{queue => NewQueue}}.
+    {noreply, Stream#{queue => NewQueue}};
+%%info_response(Response, #{queue := Queue} = Stream) ->
+%%    NewQueue = queue:in(Response, Queue),
+%%    {noreply, Stream#{queue => NewQueue}}.
 
+info_response(eof = Response, #{type := Type} = Stream) ->
+    lager:info("info_response ~p, stream type: ~p", [Response, Type]),
+    {stop, normal, Stream};
+info_response(Response, #{handler_callback := CB, handler_state := CBState} = Stream) ->
+    lager:info("info_response ~p, CB: ~p", [Response, CB]),
+    NewCBState = CB:handle_msg(Response, CBState),
+    {noreply, Stream#{handler_callback_state => NewCBState}}.
 %% TODO: fix the error handling, currently it is very hard to understand the
 %% error that results from a bad message (Map).
 encode(#{encoder := Encoder,
@@ -373,6 +428,11 @@ process_response(Pid, Timeout) ->
         {headers, #{<<":status">> := HttpStatus} = Headers} ->
             {error, #{error_type => http,
                       status => {http, HttpStatus},
+                      headers => Headers}};
+        {headers, #{<<"grpc-status">> := GrpcStatus} = Headers}
+          when GrpcStatus == <<"14">> ->
+            {error, #{error_type => http,
+                      status => {http, <<"503">>},
                       headers => Headers}};
         {error, timeout} ->
             {error, #{error_type => timeout}}

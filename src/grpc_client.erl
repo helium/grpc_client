@@ -1,3 +1,22 @@
+%% NOTE:
+%% copied and modified from https://github.com/Bluehouse-Technology/grpc_client/blob/master/src/grpc_client.erl
+%% requires the gpb modules to have been created with the following config:
+%%{gpb_opts, [
+%%        {rename,{msg_fqname,base_name}},
+%%        use_packages,
+%%        {report_errors, false},
+%%        {descriptor, false},
+%%        {recursive, false},
+%%        {i, "_build/default/lib/helium_proto/src"},
+%%        {o, "src/grpc/autogen/client"},
+%%        {module_name_prefix, ""},
+%%        {module_name_suffix, "_client_pb"},
+%%        {rename, {msg_name, {suffix, "_pb"}}},
+%%        {strings_as_binaries, false},
+%%        type_specs,
+%%        {defs_as_proplists, true}
+%%]}
+
 %%%-------------------------------------------------------------------
 %%% Licensed to the Apache Software Foundation (ASF) under one
 %%% or more contributor license agreements.  See the NOTICE file
@@ -64,7 +83,10 @@
 %% Passed on to the HTTP/2 client. See the documentation of 'http2_client' for the options
 %% that can be specified for the default HTTP2/2 client.
 
--type connection() :: grpc_client_connection:connection().
+-type connection() :: #{http_connection := pid(),
+                        host := binary(),
+                        scheme := binary(),
+                        client := module()}.
 
 -type metadata_key() :: binary().
 -type metadata_value() :: binary().
@@ -84,23 +106,23 @@
 
 -type get_response()  :: rcv_response() | empty.
 
--type unary_response(Type) :: ok_response(Type) | error_response(Type).
+-type unary_response() :: ok_response() | error_response().
 
--type ok_response(Type) ::
-    {ok, #{result := Type,
+-type ok_response() ::
+    {ok, #{result := any(),
            status_message := binary(),
            http_status := 200,
            grpc_status := 0,
            headers := metadata(),
            trailers := metadata()}}.
 
--type error_response(Type) ::
-    {error, #{error_type := error_type(),
+-type error_response() ::
+    {error, #{error_type => error_type(),
               http_status => integer(),
               grpc_status => integer(),
               status_message => binary(),
               headers => metadata(),
-              result => Type,
+              result => any(),
               trailers => grpc:metadata()}}.
 
 -type error_type() :: client | timeout | http | grpc.
@@ -109,7 +131,7 @@
               stream_option/0,
               connection_option/0,
               client_stream/0,
-              unary_response/1,
+              unary_response/0,
               metadata/0,
               compression_method/0
              ]).
@@ -164,7 +186,7 @@ connect(Transport, Host, Port, Options) ->
 -spec new_stream(Connection::connection(),
                  Service::atom(),
                  Rpc::atom(),
-                 DecoderModule::module()) -> {ok, client_stream()}.
+                 DecoderModule::module()) -> {ok, Pid::pid()} | {error, Reason::term()}.
 %% @equiv new_stream(Connection, Service, Rpc, DecoderModule, [])
 new_stream(Connection, Service, Rpc, DecoderModule) ->
     new_stream(Connection, Service, Rpc, DecoderModule, []).
@@ -173,23 +195,22 @@ new_stream(Connection, Service, Rpc, DecoderModule) ->
                  Service::atom(),
                  Rpc::atom(),
                  DecoderModule::module(),
-                 Options::[stream_option()]) -> {ok, client_stream()}.
+                 Options::[stream_option()]) -> {ok, Pid::pid()} | {error, Reason::term()}.
 %% @doc Create a new stream to start a new RPC.
 new_stream(Connection, Service, Rpc, DecoderModule, Options) ->
-    grpc_client_stream:new(Connection, Service, Rpc, DecoderModule, Options).
+    CBMod = proplists:get_value(callback_mod, Options),
+    grpc_client_stream:new(Connection, Service, Rpc, DecoderModule, Options, CBMod).
 
--spec send(Stream::client_stream(), Msg::map()) -> ok.
+-spec send(Stream::client_stream(), Msg::any()) -> ok.
 %% @doc Send a message from the client to the server.
-send(Stream, Msg) when is_pid(Stream),
-                       is_map(Msg) ->
+send(Stream, Msg) when is_pid(Stream) ->
     grpc_client_stream:send(Stream, Msg).
 
 -spec send_last(Stream::client_stream(), Msg::map()) -> ok.
 %% @doc Send a message to server and mark it as the last message
 %% on the stream. For simple RPC and client-streaming RPCs that
 %% will trigger the response from the server.
-send_last(Stream, Msg) when is_pid(Stream),
-                            is_map(Msg) ->
+send_last(Stream, Msg) when is_pid(Stream)->
     grpc_client_stream:send_last(Stream, Msg).
 
 -spec rcv(Stream::client_stream()) -> rcv_response().
@@ -214,9 +235,9 @@ rcv(Stream, Timeout) ->
 get(Stream) ->
     grpc_client_stream:get(Stream).
 
--spec ping(Connection::connection(),
-           Timeout::timeout()) -> {ok, RoundTripTime::integer()} |
-                                  {error, term()}.
+-spec ping(
+    Connection::connection(),
+    Timeout::timeout()) -> {ok, RoundTripTime::integer()} | {error, term()}.
 %% @doc Send a PING request.
 ping(Connection, Timeout) ->
     grpc_client_connection:ping(Connection, Timeout).
@@ -240,10 +261,11 @@ stop_connection(Connection) ->
     grpc_client_connection:stop(Connection).
 
 -spec unary(Connection::connection(),
-            Message::map(), Service::atom(), Rpc::atom(),
+            Message::tuple(), Service::atom(), Rpc::atom(),
             Decoder::module(),
             Options::[stream_option() |
-                      {timeout, timeout()}]) -> unary_response(map()).
+                      {timeout, timeout()} |
+                      {callback_mod, atom()}]) -> unary_response().
 %% @doc Call a unary rpc in one go.
 %%
 %% Set up a stream, receive headers, message and trailers, stop
@@ -252,12 +274,13 @@ unary(Connection, Message, Service, Rpc, Decoder, Options) ->
     {Timeout, StreamOptions} = grpc_lib:keytake(timeout, Options, infinity),
     try
         {ok, Stream} = new_stream(Connection, Service,
-                                  Rpc, Decoder, StreamOptions),
+                                  Rpc, Decoder, [{type, unary} | StreamOptions]),
         Response = grpc_client_stream:call_rpc(Stream, Message, Timeout),
         stop_stream(Stream),
         Response
     catch
-        _Type:_Error ->
+        _Type:_Error:_Stack ->
+            lager:warning("Failed to create stream. Type: ~p, Error: ~p, Stack:~p", [_Type, _Error, _Stack]),
             {error, #{error_type => client,
-                      status_message => <<"error creating stream">>}}
+                      status_message => <<"stream create failed">>}}
     end.
