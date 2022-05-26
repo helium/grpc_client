@@ -368,7 +368,7 @@ info_response(Response, #{queue := Queue, type := unary} = Stream) ->
 %%    NewQueue = queue:in(Response, Queue),
 %%    {noreply, Stream#{queue => NewQueue}}.
 
-info_response(eof = Response, #{type := Type} = Stream) ->
+info_response(eof = Response, #{type := Type, state := closed} = Stream) ->
     lager:info("info_response ~p, stream type: ~p", [Response, Type]),
     {stop, normal, Stream};
 info_response(Response, #{handler_callback := CB, handler_state := CBState} = Stream) ->
