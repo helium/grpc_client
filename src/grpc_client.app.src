@@ -4,4 +4,7 @@
   {modules,[]},
   {registered, []},
   {env, []},
-  {applications,[]}]}.
+  {applications,[
+        grpc_lib,
+        http2_client
+    ]}]}.
